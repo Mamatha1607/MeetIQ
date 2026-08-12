@@ -8,9 +8,10 @@ Purpose:
 ===========================================================================
     """
 from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-
+from sqlalchemy.orm import sessionmaker, Session
+from collections.abc import Generator
 from app.core.config import settings
+
 
 # The engine manages the application's connection pool and
 # communication with PostgreSQL.
@@ -25,3 +26,15 @@ SessionLocal = sessionmaker(
     autoflush=False,
     autocommit=False,
 )
+def get_db() -> Generator[Session, None, None]:
+    """
+    Provides a database session for a single request
+    and ensures that it is closed afterward.
+    """
+
+    db = SessionLocal()
+
+    try:
+        yield db #yield temporarily gives the session to FastAPI:
+    finally:
+        db.close() #after yeield clean it up

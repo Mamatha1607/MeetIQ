@@ -1,4 +1,5 @@
 from fastapi import FastAPI
+from app.api.meeting import router as meeting_router
 
 app = FastAPI(
     title="MeetIQ API",
@@ -10,3 +11,5 @@ app = FastAPI(
 @app.get("/health")
 def health_check() -> dict[str, str]:
     return {"status": "MeetIQ API is running"}
+
+app.include_router(meeting_router)

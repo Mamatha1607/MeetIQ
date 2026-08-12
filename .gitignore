@@ -6,10 +6,12 @@ __pycache__/
 # Environment
 .env
 .env.*
-
+# Logs
+*.log
 # IDE
 .vscode/
 .idea/
+**/notes.txt
 
 # OS
 .DS_Store
