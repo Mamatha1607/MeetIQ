@@ -4,7 +4,9 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 import uuid
 from pathlib import Path
-
+from datetime import datetime, timezone
+from kombu.exceptions import OperationalError
+from app.worker.tasks import process_meeting_task
 
 from fastapi import File, UploadFile
 
@@ -13,7 +15,6 @@ from app.models.meeting import Meeting, MeetingStatus
 from app.models.meeting_file import MeetingFile
 from app.schemas.meeting import MeetingCreate, MeetingResponse
 from app.schemas.meeting_file import MeetingFileUploadResponse
-from app.services.meeting_processing import process_meeting
 from app.models.transcript import Transcript
 from app.schemas.transcript import TranscriptResponse
 
@@ -191,49 +192,82 @@ def upload_meeting_file(
     "filename": meeting_file.original_filename,
     "status": meeting.status,
 }
-
-
 @router.post(
     "/{meeting_id}/process",
-    response_model = MeetingResponse,
+    response_model=MeetingResponse,
+    status_code=status.HTTP_202_ACCEPTED,
 )
 def start_meeting_processing(
-    meeting_id : uuid.UUID,
-    db : Session = Depends(get_db),
+    meeting_id: uuid.UUID,
+    db: Session = Depends(get_db),
 ):
-     """
-    Starts processing for an uploaded meeting.
     """
-      # Find the meeting that the client wants to process.
-     meeting = db.get(Meeting, meeting_id)
+    Queue an uploaded meeting for background transcription.
+    """
 
-     # The requested meeting must exist before processing can start
-     if meeting is None:
-         raise HTTPException(
-             status_code = status.HTTP_404_NOT_FOUND,
-             detail = "Meeting is not found",
-         )
-       # Delegate the actual processing lifecycle logic to the service layer.
-     try:
-         meeting = process_meeting(
-             meeting = meeting,
-             db = db,
-         )
-     except ValueError as exc:
-         # The meeting exists, but its current state does not allow processing
-          raise HTTPException(
-              status_code = status.HTTP_409_CONFLICT,
-              detail = str(exc)
-          ) from exc
-     except Exception as exc:
-        # The processing service has already recorded the failure
-        # in PostgreSQL. Return a safe error to the API client.
-            raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Meeting processing failed",
+    # STEP 1: Lock and retrieve the meeting.
+    # This prevents two simultaneous requests from both
+    # submitting the same meeting.
+    statement = (
+        select(Meeting)
+        .where(Meeting.id == meeting_id)
+        .with_for_update()
+    )
+
+    meeting = db.scalar(statement)
+
+    # STEP 2: Validate the meeting exists.
+    if meeting is None:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Meeting is not found",
+        )
+
+    # STEP 3: Only uploaded meetings can be queued.
+    if meeting.status != MeetingStatus.UPLOADED:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Meeting must be uploaded before processing",
+        )
+
+    # STEP 4: Reserve the meeting for processing.
+    meeting.status = MeetingStatus.PROCESSING
+    meeting.processing_started_at = datetime.now(timezone.utc)
+    meeting.processing_completed_at = None
+    meeting.error_message = None
+
+    # Save the status before submitting the task.
+    db.commit()
+    db.refresh(meeting)
+
+    try:
+        # STEP 5: Submit the meeting ID to Redis.
+        # Celery will execute this task separately.
+        process_meeting_task.delay(str(meeting.id))
+
+    except (OperationalError, ConnectionError, TimeoutError) as exc:
+        # STEP 6: Handle a task submission failure.
+        db.rollback()
+        db.refresh(meeting)
+
+        meeting.status = MeetingStatus.FAILED
+        meeting.processing_completed_at = datetime.now(timezone.utc)
+        meeting.error_message = "Unable to queue meeting processing"
+
+        db.commit()
+        db.refresh(meeting)
+
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Background processing is temporarily unavailable",
         ) from exc
 
-     return meeting
+    # STEP 7: Return immediately.
+    # Whisper will run inside the Celery worker.
+    return meeting
+
 @router.get(
     "/{meeting_id}/transcript",
     response_model=TranscriptResponse,

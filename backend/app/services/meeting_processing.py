@@ -32,25 +32,9 @@ def process_meeting(
     """
 
     # STEP 1: Validate meeting status.
-    # Only uploaded meetings can start processing.
-    if meeting.status != MeetingStatus.UPLOADED:
-        raise ValueError(
-            "Meeting must be uploaded before processing"
-        )
-
-    # STEP 2: Mark the meeting as PROCESSING.
-    meeting.status = MeetingStatus.PROCESSING
-
-    # Record when processing started.
-    meeting.processing_started_at = datetime.now(timezone.utc)
-
-    # Clear any previous error.
-    meeting.error_message = None
-
-    # Save the PROCESSING state before transcription begins.
-    db.commit()
-    db.refresh(meeting)
-
+    # Only meetings already marked PROCESSING can be handled by the worker.
+    if meeting.status != MeetingStatus.PROCESSING:
+        raise ValueError("Meeting must be queued before processing")
     print(
         f"[Processing] Meeting {meeting.id} started.",
         flush=True,
@@ -141,5 +125,5 @@ def process_meeting(
             flush=True,
         )
 
-        # Re-raise the error so the API can return HTTP 500.
+        # Re-raise the error so Celery records the task as failed.
         raise

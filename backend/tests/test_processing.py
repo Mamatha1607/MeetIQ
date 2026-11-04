@@ -1,11 +1,18 @@
 
 import pytest
 from sqlalchemy import select
-
+from unittest.mock import Mock
+from app.api import meeting as meeting_api
 from app.ai.transcription.service import TranscriptionResult
 from app.models.meeting import Meeting
 from app.models.transcript import Transcript
 from app.services import meeting_processing
+import uuid
+
+from app.worker.tasks import process_meeting_task
+from app.models.meeting import MeetingStatus
+
+from kombu.exceptions import OperationalError
 
 
 def test_start_processing_uploaded_meeting(
@@ -15,25 +22,23 @@ def test_start_processing_uploaded_meeting(
     monkeypatch,
 ):
     """
-    Verify that an uploaded meeting can be processed successfully
-    and that the generated transcript is stored in PostgreSQL.
+    Verify that an uploaded meeting is queued for background
+    processing without running Whisper inside the API.
     """
 
-    # Step 1: Create a meeting.
+    # STEP 1: Create a meeting.
     create_response = client.post(
         "/meetings/",
         json={
-            "title": "Processing Test",
-            "description": "Meeting used to test processing",
+            "title": "Async Processing Test",
+            "description": "Testing Celery task submission",
         },
     )
 
     assert create_response.status_code == 201
-
     meeting_id = create_response.json()["id"]
 
-    # Step 2: Upload a recording.
-    # Fake audio bytes are sufficient because Whisper will be mocked.
+    # STEP 2: Upload a recording.
     files = {
         "file": (
             "meeting.mp3",
@@ -49,55 +54,184 @@ def test_start_processing_uploaded_meeting(
 
     assert upload_response.status_code == 200
 
-    # Step 3: Mock the Whisper transcription function.
-    # This prevents the test from loading a real AI model.
-    def fake_transcription(file_path):
-        return TranscriptionResult(
-            text="This is a test meeting transcript.",
-            language="en",
-        )
+    # STEP 3: Replace Celery's delay method with a mock.
+    # No task will be sent to Redis during this test.
+    mock_delay = Mock()
 
-    # Replace the transcription function used by the processing service.
-    # monkeypatch automatically restores the original after this test.
     monkeypatch.setattr(
-        meeting_processing,
-        "transcribe_audio",
-        fake_transcription,
+        meeting_api.process_meeting_task,
+        "delay",
+        mock_delay,
     )
 
-    # Step 4: Process the uploaded meeting.
-    process_response = client.post(
+    # STEP 4: Request background processing.
+    response = client.post(
         f"/meetings/{meeting_id}/process"
     )
 
-    assert process_response.status_code == 200
+    # The API accepts the job without waiting for Whisper.
+    assert response.status_code == 202
 
-    data = process_response.json()
+    data = response.json()
 
-    # Step 5: Verify the meeting processing lifecycle.
-    # Our current implementation processes synchronously.
-    assert data["status"] == "completed"
-
-    # Processing start and completion timestamps must be recorded.
+    # STEP 5: Verify the meeting is marked PROCESSING.
+    assert data["status"] == "processing"
     assert data["processing_started_at"] is not None
-    assert data["processing_completed_at"] is not None
-
-    # Successful processing should not contain an error.
+    assert data["processing_completed_at"] is None
     assert data["error_message"] is None
 
-    # Step 6: Retrieve the transcript directly from the test database.
+    # STEP 6: Verify Celery was called exactly once.
+    mock_delay.assert_called_once_with(meeting_id)
+
+    # STEP 7: Verify no transcript exists yet.
+    # The worker has not executed because delay was mocked.
     statement = select(Transcript).where(
         Transcript.meeting_id == meeting_id
     )
 
     transcript = db_session.scalar(statement)
 
-    # A transcript should exist after successful processing.
-    assert transcript is not None
+    assert transcript is None
 
-    # Verify that the mocked Whisper output was saved correctly.
-    assert transcript.text == "This is a test meeting transcript."
-    assert transcript.language == "en"
+def test_redis_failure_marks_meeting_failed(
+    client,
+    db_session,
+    temporary_upload_dir,
+    monkeypatch,
+):
+    """
+    Verify that a Redis publishing failure returns HTTP 503
+    and records the failure in PostgreSQL.
+    """
+
+    # STEP 1: Create a meeting.
+    create_response = client.post(
+        "/meetings/",
+        json={
+            "title": "Redis Failure Test",
+            "description": "Testing queue connection failure",
+        },
+    )
+
+    assert create_response.status_code == 201
+    meeting_id = create_response.json()["id"]
+
+    # STEP 2: Upload a recording.
+    upload_response = client.post(
+        f"/meetings/{meeting_id}/upload",
+        files={
+            "file": (
+                "meeting.mp3",
+                b"fake audio content",
+                "audio/mpeg",
+            )
+        },
+    )
+
+    assert upload_response.status_code == 200
+
+    # STEP 3: Simulate a Redis connection failure.
+    def failing_delay(meeting_id):
+        raise OperationalError("Redis connection unavailable")
+
+    monkeypatch.setattr(
+        meeting_api.process_meeting_task,
+        "delay",
+        failing_delay,
+    )
+
+    # STEP 4: Attempt to queue the meeting.
+    response = client.post(
+        f"/meetings/{meeting_id}/process"
+    )
+
+    # The API should report a temporary service failure.
+    assert response.status_code == 503
+    assert response.json() == {
+        "detail": "Background processing is temporarily unavailable"
+    }
+
+    # STEP 5: Verify the database state.
+    meeting = db_session.get(Meeting, meeting_id)
+    db_session.refresh(meeting)
+
+    assert meeting.status.value == "failed"
+    assert meeting.processing_completed_at is not None
+    assert meeting.error_message == "Unable to queue meeting processing"
+
+    # STEP 6: No transcript should exist.
+    statement = select(Transcript).where(
+        Transcript.meeting_id == meeting_id
+    )
+
+    assert db_session.scalar(statement) is None
+
+
+def test_duplicate_processing_request(
+    client,
+    temporary_upload_dir,
+    monkeypatch,
+):
+    """
+    Verify that the same meeting cannot be queued twice.
+    """
+
+    # STEP 1: Create a meeting.
+    create_response = client.post(
+        "/meetings/",
+        json={
+            "title": "Duplicate Processing Test",
+            "description": "Testing duplicate Celery submissions",
+        },
+    )
+
+    assert create_response.status_code == 201
+    meeting_id = create_response.json()["id"]
+
+    # STEP 2: Upload a recording.
+    upload_response = client.post(
+        f"/meetings/{meeting_id}/upload",
+        files={
+            "file": (
+                "meeting.mp3",
+                b"fake audio content",
+                "audio/mpeg",
+            )
+        },
+    )
+
+    assert upload_response.status_code == 200
+
+    # STEP 3: Mock Celery so no real task is submitted.
+    mock_delay = Mock()
+
+    monkeypatch.setattr(
+        meeting_api.process_meeting_task,
+        "delay",
+        mock_delay,
+    )
+
+    # STEP 4: First processing request.
+    first_response = client.post(
+        f"/meetings/{meeting_id}/process"
+    )
+
+    assert first_response.status_code == 202
+
+    # STEP 5: Attempt to process the same meeting again.
+    second_response = client.post(
+        f"/meetings/{meeting_id}/process"
+    )
+
+    # The meeting is already PROCESSING.
+    assert second_response.status_code == 409
+
+    assert second_response.json() == {
+        "detail": "Meeting must be uploaded before processing"
+    }
+
+    # STEP 6: Verify only one task was submitted.
+    mock_delay.assert_called_once_with(meeting_id)
 
 
 def test_created_meeting_cannot_start_processing(client):
@@ -153,6 +287,7 @@ def test_nonexistent_meeting_cannot_start_processing(client):
     }
 
 
+
 def test_processing_failure_marks_meeting_failed(
     client,
     db_session,
@@ -160,40 +295,53 @@ def test_processing_failure_marks_meeting_failed(
     monkeypatch,
 ):
     """
-    Verify that a transcription failure updates the meeting
-    status to FAILED and stores the error message.
+    Verify that a Whisper failure inside the Celery worker
+    marks the meeting FAILED and saves the error.
     """
 
-    # Step 1: Create a meeting.
+    # STEP 1: Create a meeting.
     create_response = client.post(
         "/meetings/",
         json={
-            "title": "Failure Test",
-            "description": "Testing transcription failure handling",
+            "title": "Whisper Failure Test",
+            "description": "Testing worker failure handling",
         },
     )
 
     assert create_response.status_code == 201
-
     meeting_id = create_response.json()["id"]
 
-    # Step 2: Upload a recording.
-    files = {
-        "file": (
-            "meeting.mp3",
-            b"fake audio content",
-            "audio/mpeg",
-        )
-    }
-
+    # STEP 2: Upload a fake recording.
     upload_response = client.post(
         f"/meetings/{meeting_id}/upload",
-        files=files,
+        files={
+            "file": (
+                "meeting.mp3",
+                b"fake audio content",
+                "audio/mpeg",
+            )
+        },
     )
 
     assert upload_response.status_code == 200
 
-    # Step 3: Mock Whisper to simulate a transcription failure.
+    # STEP 3: Mock task submission.
+    # This lets FastAPI update the status without using Redis.
+    mock_delay = Mock()
+
+    monkeypatch.setattr(
+        meeting_api.process_meeting_task,
+        "delay",
+        mock_delay,
+    )
+
+    response = client.post(
+        f"/meetings/{meeting_id}/process"
+    )
+
+    assert response.status_code == 202
+
+    # STEP 4: Simulate Whisper failing.
     def failing_transcription(file_path):
         raise RuntimeError("Transcription failed")
 
@@ -202,41 +350,31 @@ def test_processing_failure_marks_meeting_failed(
         "transcribe_audio",
         failing_transcription,
     )
-    
-# Step 4: Attempt processing.
-# The API should catch the internal transcription error
-# and return a safe HTTP 500 response.
-    response = client.post(
-        f"/meetings/{meeting_id}/process"
-    )
 
-    # Verify the HTTP response.
-    assert response.status_code == 500
-
-    # Internal error details should not be exposed to API clients.
-    assert response.json() == {
-        "detail": "Meeting processing failed"
-    }
-
-    # Step 5: Retrieve the meeting directly from the test database.
-    meeting = db_session.get(Meeting, meeting_id)
-
-    assert meeting is not None
-
+    # STEP 5: Execute the processing service using the test DB.
+    # We call the service directly to avoid Celery opening
+    # a separate session connected to the development database.
+    meeting = db_session.get(Meeting, uuid.UUID(meeting_id))
     db_session.refresh(meeting)
 
-    # Processing failure should transition the meeting to FAILED.
-    assert meeting.status.value == "failed"
+    assert meeting.status == MeetingStatus.PROCESSING
 
-    # Verify that failure information was persisted.
+    with pytest.raises(RuntimeError, match="Transcription failed"):
+        meeting_processing.process_meeting(
+            meeting=meeting,
+            db=db_session,
+        )
+
+    # STEP 6: Refresh the meeting to verify persisted changes.
+    db_session.refresh(meeting)
+
+    assert meeting.status == MeetingStatus.FAILED
     assert meeting.processing_completed_at is not None
     assert meeting.error_message == "Transcription failed"
 
-    # Step 6: Verify that no transcript was saved after the failure.
+    # STEP 7: Verify no transcript was saved.
     statement = select(Transcript).where(
-        Transcript.meeting_id == meeting_id
+        Transcript.meeting_id == uuid.UUID(meeting_id)
     )
 
-    transcript = db_session.scalar(statement)
-
-    assert transcript is None
+    assert db_session.scalar(statement) is None
