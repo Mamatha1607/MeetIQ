@@ -5,6 +5,8 @@ from sqlalchemy import pool
 from app.db.base import Base
 from app.core.config import settings
 from app.models.meeting import Meeting 
+from app.models.meeting_file import MeetingFile
+from app.models.transcript import Transcript
 
 from alembic import context
 
