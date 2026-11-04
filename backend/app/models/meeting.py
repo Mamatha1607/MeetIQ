@@ -58,3 +58,15 @@ class Meeting(Base):
         onupdate=func.now(),
         nullable=False,
     )
+    processing_started_at : Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable = True,
+    )
+    processing_completed_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=True),
+        nullable = True,
+    )
+    error_message : Mapped[String] = mapped_column(
+        String(2000),
+        nullable = True,
+    )

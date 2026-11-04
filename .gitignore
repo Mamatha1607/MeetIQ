@@ -3,15 +3,24 @@ backend/.venv/
 __pycache__/
 *.py[cod]
 
-# Environment
+
+# Local secrets
 .env
 .env.*
+!.env.example
 # Logs
 *.log
 # IDE
 .vscode/
 .idea/
 **/notes.txt
+# Local meeting recordings and generated uploads
+backend/uploads/
+*.wav
+*.mp3
+*.mpeg
+
+
 
 # OS
 .DS_Store

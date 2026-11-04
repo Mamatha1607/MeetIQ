@@ -15,6 +15,7 @@ class MeetingCreate(BaseModel):
         default=None,
         max_length=2000,
     )
+
 class MeetingResponse(BaseModel):
 
     """
@@ -27,6 +28,10 @@ class MeetingResponse(BaseModel):
     status: MeetingStatus
     created_at: datetime
     updated_at: datetime
+
+    processing_started_at: datetime | None
+    processing_completed_at: datetime | None
+    error_message: str | None
 
     #from_attributes=True → Allows Pydantic to read data from database objects.
     model_config = ConfigDict(from_attributes=True) 
