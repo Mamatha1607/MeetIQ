@@ -21,11 +21,15 @@ from app.ai.transcription.service import transcribe_audio
 from app.models.meeting import Meeting, MeetingStatus
 from app.models.meeting_file import MeetingFile
 from app.models.transcript import Transcript
-
+import uuid
+from sqlalchemy import select, update
+from app.ai.summarization.service import generate_meeting_insights
+from app.models.meeting_insight import MeetingInsight
 
 def process_meeting(
     meeting: Meeting,
     db: Session,
+    attempt_id: uuid.UUID,
 ) -> Meeting:
     """
     Process an uploaded meeting and manage its lifecycle.
@@ -56,6 +60,8 @@ def process_meeting(
 
         # Convert the stored file path into a Path object.
         file_path = Path(meeting_file.storage_path)
+        # Finish the database read transaction before transcription.
+        db.commit()
 
         print(
             f"[Processing] Recording found: {file_path.name}",
@@ -74,6 +80,14 @@ def process_meeting(
             "[Processing] Whisper transcription completed.",
             flush=True,
         )
+        # Generate structured meeting insights using Ollama.
+        print("[Processing] Generating AI insights...", flush=True)
+
+        insights_result = generate_meeting_insights(
+            transcription_result.text
+        )
+
+        print("[Processing] AI insights generated.", flush=True)
 
         # STEP 5: Save the generated transcript.
         transcript = Transcript(
@@ -81,16 +95,42 @@ def process_meeting(
             text=transcription_result.text,
             language=transcription_result.language,
         )
+        meeting_insight = MeetingInsight(
+            meeting_id=meeting.id,
+            summary=insights_result.summary,
+            key_points=insights_result.key_points,
+            decisions=insights_result.decisions,
+            action_items=[
+                item.model_dump()
+                for item in insights_result.action_items
+            ],
+        )
+        # Atomically verify ownership and mark the meeting completed.
+        statement = (
+            update(Meeting)
+            .where(
+                Meeting.id == meeting.id,
+                Meeting.status == MeetingStatus.PROCESSING,
+                Meeting.processing_attempt_id == attempt_id,
+            )
+            .values(
+                status=MeetingStatus.COMPLETED,
+                processing_completed_at=datetime.now(timezone.utc),
+            )
+            .execution_options(synchronize_session=False)
+        )
 
+        result = db.execute(statement)
+
+        if result.rowcount != 1:
+            db.rollback()
+            raise RuntimeError(
+                "Processing attempt no longer owns this meeting"
+            )
+
+        # Save transcript in the same transaction as the status update.
         db.add(transcript)
-
-        # STEP 6: Mark processing as completed.
-        meeting.status = MeetingStatus.COMPLETED
-
-        # Record completion time.
-        meeting.processing_completed_at = datetime.now(timezone.utc)
-
-        # Save the transcript and updated meeting status.
+        db.add(meeting_insight)
         db.commit()
         db.refresh(meeting)
 
@@ -102,28 +142,34 @@ def process_meeting(
         return meeting
 
     except Exception as exc:
-        # STEP 7: Handle processing failures.
-
-        # Roll back any uncommitted database changes.
         db.rollback()
+        if isinstance(exc, RuntimeError) and str(exc) == (
+            "Processing attempt no longer owns this meeting"
+        ):
+            raise
 
-        # Mark the meeting as FAILED.
-        meeting.status = MeetingStatus.FAILED
-
-        # Record when processing failed.
-        meeting.processing_completed_at = datetime.now(timezone.utc)
-
-        # Store the failure reason for debugging.
-        meeting.error_message = str(exc)
-
-        # Persist the FAILED state.
-        db.commit()
-        db.refresh(meeting)
-
-        print(
-            f"[Processing] Meeting {meeting.id} failed: {exc}",
-            flush=True,
+        # Only the current processing attempt can mark the meeting FAILED.
+        statement = (
+            update(Meeting)
+            .where(
+                Meeting.id == meeting.id,
+                Meeting.status == MeetingStatus.PROCESSING,
+                Meeting.processing_attempt_id == attempt_id,
+            )
+            .values(
+                status=MeetingStatus.FAILED,
+                processing_completed_at=datetime.now(timezone.utc),
+                error_message=str(exc),
+            )
+            .execution_options(synchronize_session=False)
         )
 
-        # Re-raise the error so Celery records the task as failed.
+        result = db.execute(statement)
+
+        if result.rowcount == 1:
+            db.commit()
+        else:
+            # Ownership was lost; do not modify the meeting.
+            db.rollback()
+
         raise

@@ -35,3 +35,17 @@ class MeetingResponse(BaseModel):
 
     #from_attributes=True → Allows Pydantic to read data from database objects.
     model_config = ConfigDict(from_attributes=True) 
+    
+class MeetingUpdate(BaseModel):
+    """Fields that can be updated on an existing meeting."""
+
+    title: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=255,
+    )
+
+    description: str | None = Field(
+        default=None,
+        max_length=2000,
+    )

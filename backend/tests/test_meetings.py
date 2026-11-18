@@ -3,13 +3,13 @@ Tests meeting API endpoints.
 """
 
 
-def test_create_meeting(client):
+def test_create_meeting(authenticated_client):
     payload = {
         "title": "Weekly Engineering Sync",
         "description": "Backend planning meeting",
     }
 
-    response = client.post(
+    response = authenticated_client.post(
         "/meetings/",
         json=payload,
     )
@@ -27,20 +27,20 @@ def test_create_meeting(client):
     assert "updated_at" in data
 
 
-def test_list_meetings(client):
+def test_list_meetings(authenticated_client):
     payload = {
         "title": "Sprint Planning",
         "description": "Weekly sprint planning meeting",
     }
 
-    create_response = client.post(
+    create_response = authenticated_client.post(
         "/meetings/",
         json=payload,
     )
 
     assert create_response.status_code == 201
 
-    response = client.get("/meetings/")
+    response = authenticated_client.get("/meetings/")
 
     assert response.status_code == 200
 
@@ -52,13 +52,13 @@ def test_list_meetings(client):
     assert data[0]["status"] == "created"
 
 
-def test_get_meeting_by_id(client):
+def test_get_meeting_by_id(authenticated_client):
     payload = {
         "title": "Architecture Review",
         "description": "Backend design discussion",
     }
 
-    create_response = client.post(
+    create_response = authenticated_client.post(
         "/meetings/",
         json=payload,
     )
@@ -68,7 +68,7 @@ def test_get_meeting_by_id(client):
     created_meeting = create_response.json()
     meeting_id = created_meeting["id"]
 
-    response = client.get(f"/meetings/{meeting_id}")
+    response = authenticated_client.get(f"/meetings/{meeting_id}")
 
     assert response.status_code == 200
 
@@ -80,14 +80,14 @@ def test_get_meeting_by_id(client):
     assert data["status"] == "created"
 
 
-def test_get_nonexistent_meeting_returns_404(client):
+def test_get_nonexistent_meeting_returns_404(authenticated_client):
     missing_meeting_id = "11111111-1111-1111-1111-111111111111"
 
-    response = client.get(
+    response = authenticated_client.get(
         f"/meetings/{missing_meeting_id}"
     )
 
     assert response.status_code == 404
     assert response.json() == {
-        "detail": "Meeting Notfound"
+        "detail": "Meeting not found"
     }

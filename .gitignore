@@ -25,3 +25,8 @@ backend/uploads/
 # OS
 .DS_Store
 Thumbs.db
+# Node dependencies
+node_modules/
+
+# Celery Beat runtime files
+celerybeat-schedule*

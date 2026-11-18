@@ -8,6 +8,7 @@ from app.models.meeting import Meeting
 from app.models.transcript import Transcript
 from app.services import meeting_processing
 import uuid
+from app.worker import tasks as worker_tasks
 
 from app.worker.tasks import process_meeting_task
 from app.models.meeting import MeetingStatus
@@ -16,7 +17,7 @@ from kombu.exceptions import OperationalError
 
 
 def test_start_processing_uploaded_meeting(
-    client,
+    authenticated_client,
     db_session,
     temporary_upload_dir,
     monkeypatch,
@@ -27,7 +28,7 @@ def test_start_processing_uploaded_meeting(
     """
 
     # STEP 1: Create a meeting.
-    create_response = client.post(
+    create_response = authenticated_client.post(
         "/meetings/",
         json={
             "title": "Async Processing Test",
@@ -47,7 +48,7 @@ def test_start_processing_uploaded_meeting(
         )
     }
 
-    upload_response = client.post(
+    upload_response = authenticated_client.post(
         f"/meetings/{meeting_id}/upload",
         files=files,
     )
@@ -65,7 +66,7 @@ def test_start_processing_uploaded_meeting(
     )
 
     # STEP 4: Request background processing.
-    response = client.post(
+    response = authenticated_client.post(
         f"/meetings/{meeting_id}/process"
     )
 
@@ -75,8 +76,8 @@ def test_start_processing_uploaded_meeting(
     data = response.json()
 
     # STEP 5: Verify the meeting is marked PROCESSING.
-    assert data["status"] == "processing"
-    assert data["processing_started_at"] is not None
+    assert data["status"] == "queued"
+    assert data["processing_started_at"] is  None
     assert data["processing_completed_at"] is None
     assert data["error_message"] is None
 
@@ -94,7 +95,7 @@ def test_start_processing_uploaded_meeting(
     assert transcript is None
 
 def test_redis_failure_marks_meeting_failed(
-    client,
+    authenticated_client,
     db_session,
     temporary_upload_dir,
     monkeypatch,
@@ -105,7 +106,7 @@ def test_redis_failure_marks_meeting_failed(
     """
 
     # STEP 1: Create a meeting.
-    create_response = client.post(
+    create_response = authenticated_client.post(
         "/meetings/",
         json={
             "title": "Redis Failure Test",
@@ -117,7 +118,7 @@ def test_redis_failure_marks_meeting_failed(
     meeting_id = create_response.json()["id"]
 
     # STEP 2: Upload a recording.
-    upload_response = client.post(
+    upload_response = authenticated_client.post(
         f"/meetings/{meeting_id}/upload",
         files={
             "file": (
@@ -141,7 +142,7 @@ def test_redis_failure_marks_meeting_failed(
     )
 
     # STEP 4: Attempt to queue the meeting.
-    response = client.post(
+    response = authenticated_client.post(
         f"/meetings/{meeting_id}/process"
     )
 
@@ -168,7 +169,7 @@ def test_redis_failure_marks_meeting_failed(
 
 
 def test_duplicate_processing_request(
-    client,
+    authenticated_client,
     temporary_upload_dir,
     monkeypatch,
 ):
@@ -177,7 +178,7 @@ def test_duplicate_processing_request(
     """
 
     # STEP 1: Create a meeting.
-    create_response = client.post(
+    create_response = authenticated_client.post(
         "/meetings/",
         json={
             "title": "Duplicate Processing Test",
@@ -189,7 +190,7 @@ def test_duplicate_processing_request(
     meeting_id = create_response.json()["id"]
 
     # STEP 2: Upload a recording.
-    upload_response = client.post(
+    upload_response = authenticated_client.post(
         f"/meetings/{meeting_id}/upload",
         files={
             "file": (
@@ -212,14 +213,14 @@ def test_duplicate_processing_request(
     )
 
     # STEP 4: First processing request.
-    first_response = client.post(
+    first_response = authenticated_client.post(
         f"/meetings/{meeting_id}/process"
     )
 
     assert first_response.status_code == 202
 
     # STEP 5: Attempt to process the same meeting again.
-    second_response = client.post(
+    second_response = authenticated_client.post(
         f"/meetings/{meeting_id}/process"
     )
 
@@ -234,14 +235,14 @@ def test_duplicate_processing_request(
     mock_delay.assert_called_once_with(meeting_id)
 
 
-def test_created_meeting_cannot_start_processing(client):
+def test_created_meeting_cannot_start_processing(authenticated_client):
     """
     Verify that a meeting without an uploaded recording
     cannot start processing.
     """
 
     # Step 1: Create a meeting without uploading a file.
-    create_response = client.post(
+    create_response = authenticated_client.post(
         "/meetings/",
         json={
             "title": "Invalid Processing Test",
@@ -254,7 +255,7 @@ def test_created_meeting_cannot_start_processing(client):
     meeting_id = create_response.json()["id"]
 
     # Step 2: Attempt to process the meeting.
-    response = client.post(
+    response = authenticated_client.post(
         f"/meetings/{meeting_id}/process"
     )
 
@@ -266,7 +267,7 @@ def test_created_meeting_cannot_start_processing(client):
     }
 
 
-def test_nonexistent_meeting_cannot_start_processing(client):
+def test_nonexistent_meeting_cannot_start_processing(authenticated_client):
     """
     Verify that processing a nonexistent meeting returns HTTP 404.
     """
@@ -275,7 +276,7 @@ def test_nonexistent_meeting_cannot_start_processing(client):
     missing_meeting_id = "11111111-1111-1111-1111-111111111111"
 
     # Attempt to process a meeting that does not exist.
-    response = client.post(
+    response = authenticated_client.post(
         f"/meetings/{missing_meeting_id}/process"
     )
 
@@ -289,10 +290,11 @@ def test_nonexistent_meeting_cannot_start_processing(client):
 
 
 def test_processing_failure_marks_meeting_failed(
-    client,
+    authenticated_client,
     db_session,
     temporary_upload_dir,
     monkeypatch,
+    test_session_factory,
 ):
     """
     Verify that a Whisper failure inside the Celery worker
@@ -300,7 +302,7 @@ def test_processing_failure_marks_meeting_failed(
     """
 
     # STEP 1: Create a meeting.
-    create_response = client.post(
+    create_response = authenticated_client.post(
         "/meetings/",
         json={
             "title": "Whisper Failure Test",
@@ -312,7 +314,7 @@ def test_processing_failure_marks_meeting_failed(
     meeting_id = create_response.json()["id"]
 
     # STEP 2: Upload a fake recording.
-    upload_response = client.post(
+    upload_response = authenticated_client.post(
         f"/meetings/{meeting_id}/upload",
         files={
             "file": (
@@ -335,7 +337,7 @@ def test_processing_failure_marks_meeting_failed(
         mock_delay,
     )
 
-    response = client.post(
+    response = authenticated_client.post(
         f"/meetings/{meeting_id}/process"
     )
 
@@ -351,20 +353,23 @@ def test_processing_failure_marks_meeting_failed(
         failing_transcription,
     )
 
-    # STEP 5: Execute the processing service using the test DB.
-    # We call the service directly to avoid Celery opening
-    # a separate session connected to the development database.
-    meeting = db_session.get(Meeting, uuid.UUID(meeting_id))
-    db_session.refresh(meeting)
+        # STEP 5: Make Celery use the test database.
+    monkeypatch.setattr(
+        worker_tasks,
+        "SessionLocal",
+        test_session_factory,
+    )
 
-    assert meeting.status == MeetingStatus.PROCESSING
-
+    # Execute the worker directly without Redis.
+    # The worker claims QUEUED -> PROCESSING,
+    # then Whisper raises the simulated error.
     with pytest.raises(RuntimeError, match="Transcription failed"):
-        meeting_processing.process_meeting(
-            meeting=meeting,
-            db=db_session,
-        )
+        worker_tasks.process_meeting_task.run(meeting_id)
 
+    # STEP 6: Retrieve the meeting after worker failure.
+    db_session.expire_all()
+
+    meeting = db_session.get(Meeting, uuid.UUID(meeting_id))
     # STEP 6: Refresh the meeting to verify persisted changes.
     db_session.refresh(meeting)
 

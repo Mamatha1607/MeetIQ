@@ -1,0 +1,2 @@
+import { Construction } from 'lucide-react'
+export default function ComingSoon({title}:{title:string}){return <main className="mx-auto max-w-5xl px-6 py-12"><div className="rounded-2xl border border-slate-200 bg-white p-12 text-center shadow-sm"><Construction size={36} className="mx-auto text-indigo-600"/><h1 className="mt-5 text-2xl font-bold">{title}</h1><p className="mt-3 text-sm text-slate-500">This workspace feature is planned for a future release.</p></div></main>}

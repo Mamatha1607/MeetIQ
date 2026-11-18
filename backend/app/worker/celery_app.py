@@ -19,3 +19,9 @@ celery_app.conf.update(
     timezone="UTC",
     enable_utc=True,
 )
+celery_app.conf.beat_schedule = {
+    "recover-stuck-queued-meetings": {
+        "task": "meetiq.recover_queued",
+        "schedule": 60.0,
+    },
+}
