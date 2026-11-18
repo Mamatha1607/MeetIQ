@@ -1,6 +1,6 @@
-def test_upload_meeting_file(client, temporary_upload_dir):
+def test_upload_meeting_file(authenticated_client, temporary_upload_dir):
     # First create a meeting.
-    create_response = client.post(
+    create_response = authenticated_client.post(
         "/meetings/",
         json={
             "title": "Upload Test",
@@ -22,7 +22,7 @@ def test_upload_meeting_file(client, temporary_upload_dir):
         )
     }
 
-    response = client.post(
+    response = authenticated_client.post(
         f"/meetings/{meeting_id}/upload",
         files=files,
     )
@@ -37,8 +37,8 @@ def test_upload_meeting_file(client, temporary_upload_dir):
     assert data["status"] == "uploaded"
 
 
-def test_duplicate_upload_returns_409(client, temporary_upload_dir):
-    create_response = client.post(
+def test_duplicate_upload_returns_409(authenticated_client, temporary_upload_dir):
+    create_response = authenticated_client.post(
         "/meetings/",
         json={
             "title": "Duplicate Upload Test",
@@ -58,7 +58,7 @@ def test_duplicate_upload_returns_409(client, temporary_upload_dir):
         )
     }
 
-    first_response = client.post(
+    first_response = authenticated_client.post(
         f"/meetings/{meeting_id}/upload",
         files=files,
     )
@@ -73,7 +73,7 @@ def test_duplicate_upload_returns_409(client, temporary_upload_dir):
         )
     }
 
-    second_response = client.post(
+    second_response = authenticated_client.post(
         f"/meetings/{meeting_id}/upload",
         files=second_files,
     )
@@ -88,9 +88,9 @@ def test_duplicate_upload_returns_409(client, temporary_upload_dir):
     assert len(saved_files) == 1
 
 
-def test_unsupported_file_type_returns_415(client, temporary_upload_dir):
+def test_unsupported_file_type_returns_415(authenticated_client, temporary_upload_dir):
     # Create a valid meeting first.
-    create_response = client.post(
+    create_response = authenticated_client.post(
         "/meetings/",
         json={
             "title": "Invalid File Test",
@@ -111,7 +111,7 @@ def test_unsupported_file_type_returns_415(client, temporary_upload_dir):
         )
     }
 
-    response = client.post(
+    response = authenticated_client.post(
         f"/meetings/{meeting_id}/upload",
         files=files,
     )
@@ -126,7 +126,7 @@ def test_unsupported_file_type_returns_415(client, temporary_upload_dir):
 
 
 def test_upload_to_nonexistent_meeting_returns_404(
-    client,
+    authenticated_client,
     temporary_upload_dir,
 ):
     missing_meeting_id = "11111111-1111-1111-1111-111111111111"
@@ -139,14 +139,14 @@ def test_upload_to_nonexistent_meeting_returns_404(
         )
     }
 
-    response = client.post(
+    response = authenticated_client.post(
         f"/meetings/{missing_meeting_id}/upload",
         files=files,
     )
 
     assert response.status_code == 404
     assert response.json() == {
-        "detail": "No meeting found"
+        "detail": "Meeting not found"
     }
 
     # Nothing should be stored when the meeting does not exist.
